@@ -2,9 +2,13 @@ import logging
 import secrets
 import time
 from typing import Any, Literal
+import json
 
-import click
-from pydantic import AnyHttpUrl
+from dateutil.rrule import rrulestr
+from datetime import datetime, time
+import pytz
+
+from pydantic import AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -25,6 +29,8 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 logger = logging.getLogger(__name__)
+
+WORKS_API_BASE_URL = "https://www.worksapis.com/v1.0"
 
 
 class ServerSettings(BaseSettings):
@@ -48,7 +54,7 @@ class ServerSettings(BaseSettings):
     works_token_url: str = "https://auth.worksmobile.com/oauth2/v2.0/token"
 
     mcp_scope: str = "user"
-    works_scope: str = "user.read"
+    works_scope: str = "user.profile.read calendar task group.read group.note"
 
     def __init__(self, **data):
         """Initialize settings with values from environment variables.
@@ -154,7 +160,7 @@ class WorksOAuthProvider(OAuthAuthorizationServerProvider):
                 client_id=client_id,
                 redirect_uri=AnyHttpUrl(redirect_uri),
                 redirect_uri_provided_explicitly=redirect_uri_provided_explicitly,
-                expires_at=time.time() + 300,
+                expires_at=datetime.timestamp(datetime.now()) + 300,
                 scopes=[self.settings.mcp_scope],
                 code_challenge=code_challenge,
             )
@@ -195,7 +201,7 @@ class WorksOAuthProvider(OAuthAuthorizationServerProvider):
             token=mcp_token,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
-            expires_at=int(time.time()) + 3600,
+            expires_at=int(datetime.timestamp(datetime.now())) + 3600,
         )
 
         # Find token for this client
@@ -228,7 +234,7 @@ class WorksOAuthProvider(OAuthAuthorizationServerProvider):
             return None
 
         # Check if expired
-        if access_token.expires_at and access_token.expires_at < time.time():
+        if access_token.expires_at and access_token.expires_at < datetime.timestamp(datetime.now()):
             del self.tokens[token]
             return None
 
@@ -322,19 +328,309 @@ def create_simple_mcp_server(settings: ServerSettings) -> FastMCP:
 
     @app.tool()
     async def get_user_profile() -> dict[str, Any]:
-        """Get the authenticated user's profile information.
-
-        This is the only tool in our simple example. It requires the 'user' scope.
+        """Get user profile information.
         """
         works_token = get_works_token()
 
+        url = "{}/users/me".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": "Bearer {}".format(works_token),
+        }
+
         async with create_mcp_http_client() as client:
             response = await client.get(
-                "https://www.worksapis.com/v1.0/users/me",
-                headers={
-                    "Authorization": f"Bearer {works_token}",
-                    "Accept": "application/json; charset=UTF-8",
-                },
+                url,
+                headers=headers,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def get_events_in_calendar(
+        from_date: str =  Field(description="Start datetime (with timezone) to list user events (MUST BE ISO 8601 format, e.g. 2023-05-14T00:00:00+09:00)"),
+        until_date: str =  Field(description="End datetime (with timezone) to list user events (MUST BE ISO 8601 format, e.g. 2023-05-14T00:00:00+09:00)"),
+    ) -> dict[str, Any]:
+        """Get events in user calendar.
+        """
+        works_token = get_works_token()
+
+        url = "{}/users/me/calendar/events".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+            "Accept": "application/json; charset=UTF-8",
+        }
+
+        params = {"fromDateTime": from_date, "untilDateTime": until_date}
+
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            res_events = response.json()
+
+            from_dt = datetime.fromisoformat(from_date)
+            until_dt = datetime.fromisoformat(until_date)
+
+            from_d = datetime.combine(from_dt.date(), time())
+            until_d = datetime.combine(until_dt.date(), time())
+
+            fixed_events = []
+
+            for et in res_events["events"]:
+                for e in et["eventComponents"]:
+                    # if e["transparency"] == "TRANSPARENT":
+                    #    continue
+
+                    is_all_day = False
+
+                    start_obj = e["start"]
+                    if "dateTime" in start_obj:
+                        start_datetime = datetime.fromisoformat(start_obj["dateTime"])
+                        start_timezone = pytz.timezone(start_obj["timeZone"])
+                        start_datetime = start_datetime.astimezone(tz=start_timezone)
+                    else:
+                        is_all_day = True
+                        start_datetime = datetime.fromisoformat(start_obj["date"])
+
+                    end_obj = e["end"]
+                    if "dateTime" in end_obj:
+                        end_datetime = datetime.fromisoformat(end_obj["dateTime"])
+                        end_timezone = pytz.timezone(end_obj["timeZone"])
+                        end_datetime = end_datetime.astimezone(tz=end_timezone)
+                    else:
+                        is_all_day = True
+                        end_datetime = datetime.fromisoformat(end_obj["date"])
+
+                    if "recurrence" in e and e["recurrence"] is not None and len(e["recurrence"]) > 0:
+                        if is_all_day:
+                            rule_after_dt = from_d
+                            rule_before_dt = until_d
+                        else:
+                            rule_after_dt = from_dt
+                            rule_before_dt = until_dt
+
+                        period = end_datetime - start_datetime
+
+                        rules = "\n".join(e["recurrence"])
+                        ruleset = rrulestr(rules, forceset=True, dtstart=start_datetime)
+
+                        re_start_times = ruleset.between(rule_after_dt, rule_before_dt)
+
+                        for st in re_start_times:
+                            _st_d = st
+                            _end_d = st + period
+                            fixed_events.append({
+                                "summary": e["summary"],
+                                "start": _st_d.isoformat(),
+                                "end": _end_d.isoformat(),
+                            })
+
+                    else:
+                        _st_d = start_datetime
+                        _end_d = end_datetime
+                        fixed_events.append({
+                            "summary": e["summary"],
+                            "start": _st_d.isoformat(),
+                            "end": _end_d.isoformat(),
+                        })
+            return {"events": fixed_events}
+
+    @app.tool()
+    async def create_event_to_calendar(
+        summary: str =  Field(summary="Event title"),
+        start_time: str = Field(description="Start time to list user events (MUST BE ISO 8601 format, e.g. 2023-05-14T00:00:00)"),
+        end_time: str = Field(description="End time to list user events (MUST BE ISO 8601 format, e.g. 2023-05-14T00:00:00)"),
+    ) -> dict[str, Any]:
+        """Create an event to user calendar
+        """
+        works_token = get_works_token()
+
+        url = "{}/users/me/calendar/events".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+            "Content-Type": "application/json",
+        }
+
+        params = {
+          "eventComponents": [
+              {
+                  "summary": summary,
+                  "start": {
+                    "dateTime": start_time,
+                    "timeZone": "Asia/Tokyo"
+                  },
+                  "end": {
+                    "dateTime": end_time,
+                    "timeZone": "Asia/Tokyo"
+                  }
+              }
+          ]
+        }
+        form_data = json.dumps(params)
+
+        async with create_mcp_http_client() as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                data=form_data,
+            )
+
+            if response.status_code != 201:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def get_tasks() -> dict[str, Any]:
+        """Get todo tasks.
+        """
+        works_token = get_works_token()
+
+        url = "{}/users/me/tasks?categoryId=default".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+        }
+
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def create_task(
+        title: str =  Field(title="Todo task title"),
+        userId: str = Field(title="User ID. get_user_profile() can get userId. (UUID format e.g. userf7da-f82c-4284-13e7-030f3b4c756x)"),
+    ) -> dict[str, Any]:
+        """Create a todo task.
+        """
+        works_token = get_works_token()
+
+        url = "{}/users/me/tasks".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+            "Content-Type": "application/json",
+        }
+
+        params = {
+            "assignorId": userId,
+            "assignees": [
+                {
+                    "assigneeId": userId,
+                    "status": "TODO"
+                }
+            ],
+            "completionCondition": "ANY_ONE",
+            "title": title,
+            "content": ""
+        }
+
+        form_data = json.dumps(params)
+
+        async with create_mcp_http_client() as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                data=form_data,
+            )
+
+            if response.status_code != 201:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def get_groups() -> dict[str, Any]:
+        """Get groups. Each group has notes.
+        """
+        works_token = get_works_token()
+
+        url = "{}/groups".format(WORKS_API_BASE_URL)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+        }
+
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def get_group_note_posts(
+        groupId: str = Field(title="Group ID. get_groups() can get groupId. (UUID format e.g. group127-8545-4463-603b-04d550d23bf)"),
+    ) -> dict[str, Any]:
+        """Get list of posts in the group note. If you need body data, use get_group_note_post() with postId that this tool can get.
+        """
+        works_token = get_works_token()
+
+        url = "{}/groups/{}/note/posts".format(WORKS_API_BASE_URL, groupId)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+        }
+
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(
+                    f"API error: {response.status_code} - {response.text}"
+                )
+
+            return response.json()
+
+    @app.tool()
+    async def get_group_note_post(
+        groupId: str = Field(title="Group ID. get_groups() can get groupId. (UUID format e.g. group127-8545-4463-603b-04d550d23bf)"),
+        postId: str = Field(title="Post ID. get_groups() can get groupId. (UUID format e.g. group127-8545-4463-603b-04d550d23bf)"),
+    ) -> dict[str, Any]:
+        """Get a post information in detail. get_group_note_posts() can get postId.
+        """
+        works_token = get_works_token()
+
+        url = "{}/groups/{}/note/posts/{}".format(WORKS_API_BASE_URL, groupId, postId)
+        headers={
+            "Authorization": f"Bearer {works_token}",
+        }
+
+        async with create_mcp_http_client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
             )
 
             if response.status_code != 200:
